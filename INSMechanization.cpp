@@ -10,20 +10,30 @@ INSMechanization::INSMechanization() {
 
 // Initialization C^n_b Orientation Matrix
 void INSMechanization::initialize(double init_L_b, double init_lambda_b, double init_h_b, 
-                                double roll_rad, double pitch_rad, double yaw_rad){
+                                float roll_rad, float pitch_rad, float yaw_rad){
     L_b = init_L_b;
     lambda_b = init_lambda_b;
     h_b = init_h_b;
+    vn_eb = Eigen::Vector3f::Zero();
 
     Eigen::AngleAxisf rollAngle(roll_rad, Eigen::Vector3f::UnitX());
     Eigen::AngleAxisf pitchAngle(pitch_rad, Eigen::Vector3f::UnitY());
     Eigen::AngleAxisf yawAngle(yaw_rad, Eigen::Vector3f::UnitZ());
 
-    Cn_b = yawAngle * pitchAngle * rollAngle;               // (C^n_b) Orientation Matrix
+    Cn_b = yawAngle * pitchAngle * rollAngle;                   // (C^n_b) Orientation Matrix
 }
 
-// Find Omega^n_ie
-void computeOhmegan_ie(double L_b, Eigen::Matrix3f& Omegan_ie) {
+// Skew-Symmetric Matrix [vector X]
+Eigen::Matrix3f INSMechanization::skewSymmetric(const Eigen::Vector3f& vec) const {
+    Eigen::Matrix3f vector_skew;
+    vector_skew <<    0.0f, -vec(2),  vec(1),
+            vec(2),    0.0f, -vec(0),
+           -vec(1),  vec(0),    0.0f;
+    return vector_skew;
+}
+
+// Eq. (5.41) - Ohmega^n_ie
+Eigen::Matrix3f INSMechanization::computeOhmegan_ie(double L_b) const {
     /* For navigation purposes, a constant rotation rate 
     is assumed based on the mean sidereal day 
     
@@ -31,34 +41,60 @@ void computeOhmegan_ie(double L_b, Eigen::Matrix3f& Omegan_ie) {
     National Imagery and Mapping Agency (now NGA), TR8350.2, 
     Third Edition, 1997.)
     */
-    const double w_ie = 7.292115e-5;                        // Earth’s angular rate (rad/s)                  
+    constexpr float w_ie = 7.292115e-5f;                        // Earth’s angular rate (rad/s)                  
+    const float sin_L = static_cast<float>(std::sin(L_b));
+    const float cos_L = static_cast<float>(std::cos(L_b));
 
-    double sin_L = std::sin(L_b);
-    double cos_L = std::cos(L_b);
+    const float w_sin = w_ie * sin_L;
+    const float w_cos = w_ie * cos_L;
 
-    Omegan_ie <<  0.0,    sin_L,   0.0,
-                 -sin_L,   0.0,   -cos_L,
-                  0.0,    cos_L,   0.0;
+    Eigen::Matrix3f Ohmegan_ie;
+    Ohmegan_ie <<    0.0f,   w_sin,    0.0f,
+                  -w_sin,    0.0f,  -w_cos,
+                    0.0f,   w_cos,    0.0f;
 
-    Omegan_ie = w_ie * Omegan_ie;                           // (Omega^n_ie) Skew-symmetric Matrix
+    return Ohmegan_ie;                           
 }
 
-// Eq. (5.40) 
-void INSMechanization::updateAttitude(const Eigen::Vector3f& gyr, double T_i) {
-    // Convert gyroscope raw angular rate vector into skew-symmetric matrix [Omegab_ib]
-    Eigen::Matrix3f Omegab_ib = skewSymmetric(gyr);
-
-    // Compute Earth rotation matrix in navigation frame [Omegan_ie]
-    Eigen::Matrix3f Omegan_ie = computeOhmegan_ie(L_b);
-
-    // Compute transport rate matrix in navigation frame [Omegan_en]
-    double R_N, R_E;
-    computeEarthRadii(L_b, R_N, R_E);
-    Eigen::Matrix3f Omegan_en = computeOhmegan_en(vn_eb, L_b, h_b, R_N, R_E);
-
-    // Eq (5.40): Compute orientation matrix time derivative (diffCn_b)
-    Eigen::Matrix3f diffCn_b = Cn_b * Omegab_ib - (Omegan_ie + Omegan_en) * Cn_b;
-
-    // (Next step: Discrete integration update for Cn_b using T_i...)
+// Eq. (5.44) - Ohmegan_en
+namespace{
+    constexpr double R_0   = 6378137.0;                                          // Equatorial radius / semi-major axis (m)
+    constexpr double E_SQR = 0.00669437999014;                                   // Squared eccentricity (e^2) 
 }
 
+void INSMechanization::computeEarth(double L_b, double& R_N_Lb, double& R_E_Lb) const {
+    //Find sin^2 L (sin_L_sqr)
+    const double sin_L = std::sin(L_b);
+    const double sin_L_sqr = sin_L * sin_L;                                     
+
+    // Eq. (2.105)
+    const double denom_sqrt = std::sqrt(1.0 - E_SQR * sin_L_sqr);                // sqrt(1 - e^2 * sin^2(L))
+    R_N_Lb = R_0 * (1.0 - E_SQR) / (denom_sqrt * denom_sqrt * denom_sqrt);
+    // Eq. (2.106)
+    R_E_Lb = R_0 / denom_sqrt;
+}
+
+Eigen::Matrix3f INSMechanization::computeOhmegan_en(const Eigen::Vector3f& vn_eb, 
+                                                   double L_b, 
+                                                   double h_b, 
+                                                   double R_N_Lb, 
+                                                   double R_E_Lb) 
+const {
+    const double v_N = static_cast<double>(vn_eb(0));
+    const double v_E = static_cast<double>(vn_eb(1));
+
+    const double tan_Lb = std::tan(L_b);
+
+    // Eq. (5.44) - w^n_en
+    const float w_en_x = static_cast<float>(v_E / (R_E_Lb + h_b));                  //North
+    const float w_en_y = static_cast<float>(-v_N / (R_N_Lb + h_b));                 //East
+    const float w_en_z = static_cast<float>(-v_E * tan_Lb / (R_E_Lb + h_b));        //Down
+
+    // Omega^n_en
+    Eigen::Matrix3f Omegan_en;
+    Omegan_en <<     0.0f, -w_en_z,   w_en_y,
+                  w_en_z,     0.0f,  -w_en_x,
+                 -w_en_y,   w_en_x,     0.0f;
+
+    return Omegan_en;
+}
